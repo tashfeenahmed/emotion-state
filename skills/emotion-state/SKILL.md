@@ -15,9 +15,11 @@ adds a compact `emotion_state` block to the system prompt.
 
 ## Install & enable (workspace hook)
 
-1) Copy the hook directory into your workspace:
+1) After installing the skill, copy the bundled hook into your workspace:
 
-- `hooks/emotion-state/`
+```bash
+cp -R ./skills/emotion-state/hooks/emotion-state ./hooks/
+```
 
 2) Enable the hook in OpenClaw:
 
