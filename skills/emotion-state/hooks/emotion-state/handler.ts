@@ -13,6 +13,9 @@ const DEFAULTS = {
   confidenceMin: 0.35,
   model: "gpt-4o-mini",
   stateFileName: "emotion-state.json",
+  fetchTimeoutMs: 5000,
+  maxUsers: 50,
+  lockStaleMs: 10_000,
 };
 
 const DEFAULT_LABELS = [
@@ -175,10 +178,37 @@ function extractMessagesFromContainer(container: any): SessionMessage[] {
   return messages;
 }
 
+async function readJsonlMessages(filePath: string): Promise<SessionMessage[]> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const messages: SessionMessage[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type !== "message" || !entry.message) continue;
+        const msg = entry.message;
+        const role = getRole(msg);
+        const content = extractContent(msg);
+        if (!role || !content) continue;
+        const timestamp = entry.timestamp || msg.timestamp;
+        messages.push({ role, content, timestamp });
+      } catch {
+        continue;
+      }
+    }
+    return messages;
+  } catch {
+    return [];
+  }
+}
+
 async function extractMessages(sessionEntry: any, sessionFile?: string) {
   const fromEntry = extractMessagesFromContainer(sessionEntry);
   if (fromEntry.length > 0) return fromEntry;
   if (!sessionFile) return [];
+  const fromJsonl = await readJsonlMessages(sessionFile);
+  if (fromJsonl.length > 0) return fromJsonl;
   const fromFile = await readJsonFile<any>(sessionFile);
   if (!fromFile) return [];
   return extractMessagesFromContainer(fromFile);
@@ -237,10 +267,12 @@ async function readState(statePath: string): Promise<EmotionState> {
 }
 
 async function classifyWithEndpoint(url: string, payload: { text: string; role: string }) {
+  const timeoutMs = envNumber("EMOTION_FETCH_TIMEOUT_MS", DEFAULTS.fetchTimeoutMs);
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(`Classifier returned ${response.status}`);
   return response.json();
@@ -250,6 +282,7 @@ async function classifyWithOpenAI(text: string, role: string, model: string) {
   const apiKey = envString("OPENAI_API_KEY");
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
   const baseUrl = envString("OPENAI_BASE_URL", "https://api.openai.com/v1");
+  const timeoutMs = envNumber("EMOTION_FETCH_TIMEOUT_MS", DEFAULTS.fetchTimeoutMs);
   const systemPrompt =
     "You are an emotion classifier. Return only JSON with keys: label, intensity, reason, confidence. " +
     "label is a short emotion word, intensity is low|medium|high, reason is a short clause, confidence is 0..1.";
@@ -263,17 +296,19 @@ async function classifyWithOpenAI(text: string, role: string, model: string) {
       model,
       messages: [
         { role: "system", content: systemPrompt },
-        { role, content: text },
+        { role: "user", content: `Classify the emotion in this ${role} message:\n\n${text}` },
       ],
       temperature: 0.2,
+      response_format: { type: "json_object" },
     }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) {
     throw new Error(`OpenAI returned ${response.status}`);
   }
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content || "";
-  const match = content.match(/\{[\s\S]*\}/);
+  const match = content.match(/\{[\s\S]*?\}/);
   if (!match) throw new Error("No JSON in OpenAI response");
   return JSON.parse(match[0]);
 }
@@ -317,6 +352,18 @@ function updateBucket(bucket: { latest?: EmotionEntry; history: EmotionEntry[] }
   if (bucket.history.length > historySize) bucket.history.length = historySize;
 }
 
+function pruneUsers(state: EmotionState, maxUsers: number) {
+  const keys = Object.keys(state.users);
+  if (keys.length <= maxUsers) return;
+  const sorted = keys
+    .map((key) => ({ key, ts: state.users[key].latest?.timestamp || "" }))
+    .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const toRemove = sorted.slice(0, keys.length - maxUsers);
+  for (const { key } of toRemove) {
+    delete state.users[key];
+  }
+}
+
 async function maybeUpdate(
   bucket: { latest?: EmotionEntry; history: EmotionEntry[] },
   message: SessionMessage,
@@ -334,7 +381,8 @@ async function maybeUpdate(
     entry.source_role = role;
     updateBucket(bucket, entry, historySize);
     return true;
-  } catch {
+  } catch (err) {
+    console.error("[emotion-state] Classification failed, falling back to neutral:", err);
     const entry: EmotionEntry = {
       timestamp: new Date().toISOString(),
       label: "neutral",
@@ -396,7 +444,8 @@ async function loadOtherAgents(
       if (latest) results.push({ id: entry.name, latest });
       if (results.length >= maxAgents) break;
     }
-  } catch {
+  } catch (err) {
+    console.error("[emotion-state] Failed to load other agents:", err);
     return [];
   }
   return results;
@@ -454,6 +503,32 @@ function buildEmotionBlock(
   return lines.join("\n");
 }
 
+async function acquireLock(lockPath: string, staleMs: number): Promise<boolean> {
+  try {
+    const handle = await fs.open(lockPath, "wx");
+    await handle.close();
+    return true;
+  } catch (err: any) {
+    if (err?.code !== "EEXIST") return false;
+    try {
+      const stat = await fs.stat(lockPath);
+      if (Date.now() - stat.mtimeMs > staleMs) {
+        await fs.unlink(lockPath).catch(() => {});
+        const handle = await fs.open(lockPath, "wx");
+        await handle.close();
+        return true;
+      }
+    } catch {
+      /* lock contention, give up */
+    }
+    return false;
+  }
+}
+
+async function releaseLock(lockPath: string) {
+  await fs.unlink(lockPath).catch(() => {});
+}
+
 function injectBootstrap(context: any, content: string) {
   if (!content) return;
   if (!context.bootstrapFiles) context.bootstrapFiles = [];
@@ -471,64 +546,88 @@ function injectBootstrap(context: any, content: string) {
 }
 
 export default async function handler(event: any) {
-  if (!event || event.type !== "agent" || event.action !== "bootstrap") return;
+  try {
+    if (!event || event.type !== "agent" || event.action !== "bootstrap") return;
 
-  const context = event.context || {};
-  const sessionEntry = context.sessionEntry;
-  const sessionFile = context.sessionFile;
+    const context = event.context || {};
+    const sessionEntry = context.sessionEntry;
+    const sessionFile = context.sessionFile;
 
-  const labels = envLabels();
-  const confidenceMin = envNumber("EMOTION_CONFIDENCE_MIN", DEFAULTS.confidenceMin);
-  const historySize = envNumber("EMOTION_HISTORY_SIZE", DEFAULTS.historySize);
-  const halfLifeHours = envNumber("EMOTION_HALF_LIFE_HOURS", DEFAULTS.halfLifeHours);
-  const trendWindowHours = envNumber("EMOTION_TREND_WINDOW_HOURS", DEFAULTS.trendWindowHours);
-  const maxUserEntries = envNumber("EMOTION_MAX_USER_ENTRIES", DEFAULTS.maxUserEntries);
-  const maxAgentEntries = envNumber("EMOTION_MAX_AGENT_ENTRIES", DEFAULTS.maxAgentEntries);
-  const maxOtherAgents = envNumber("EMOTION_MAX_OTHER_AGENTS", DEFAULTS.maxOtherAgents);
-  const timeZone = envString("EMOTION_TIMEZONE");
+    const labels = envLabels();
+    const confidenceMin = envNumber("EMOTION_CONFIDENCE_MIN", DEFAULTS.confidenceMin);
+    const historySize = envNumber("EMOTION_HISTORY_SIZE", DEFAULTS.historySize);
+    const halfLifeHours = envNumber("EMOTION_HALF_LIFE_HOURS", DEFAULTS.halfLifeHours);
+    const trendWindowHours = envNumber("EMOTION_TREND_WINDOW_HOURS", DEFAULTS.trendWindowHours);
+    const maxUserEntries = envNumber("EMOTION_MAX_USER_ENTRIES", DEFAULTS.maxUserEntries);
+    const maxAgentEntries = envNumber("EMOTION_MAX_AGENT_ENTRIES", DEFAULTS.maxAgentEntries);
+    const maxOtherAgents = envNumber("EMOTION_MAX_OTHER_AGENTS", DEFAULTS.maxOtherAgents);
+    const maxUsers = envNumber("EMOTION_MAX_USERS", DEFAULTS.maxUsers);
+    const staleMs = DEFAULTS.lockStaleMs;
+    const timeZone = envString("EMOTION_TIMEZONE");
 
-  const messages = await extractMessages(sessionEntry, sessionFile);
-  const latestUser = pickLatest(messages, "user");
-  const latestAssistant = pickLatest(messages, "assistant");
+    const messages = await extractMessages(sessionEntry, sessionFile);
+    const latestUser = pickLatest(messages, "user");
+    const latestAssistant = pickLatest(messages, "assistant");
 
-  const userKey = resolveUserKey(context.senderId, context.sessionKey);
-  const agentId = resolveAgentId(context.sessionKey, sessionFile);
-  const agentDir = resolveAgentDir(sessionFile, agentId);
-  const statePath = path.join(agentDir, DEFAULTS.stateFileName);
+    const userKey = resolveUserKey(context.senderId, context.sessionKey);
+    const agentId = resolveAgentId(context.sessionKey, sessionFile);
+    const agentDir = resolveAgentDir(sessionFile, agentId);
+    const statePath = path.join(agentDir, DEFAULTS.stateFileName);
+    const lockPath = `${statePath}.lock`;
 
-  const state = await readState(statePath);
-  if (!state.users[userKey]) state.users[userKey] = { history: [] };
-  if (!state.agents[agentId]) state.agents[agentId] = { history: [] };
+    const locked = await acquireLock(lockPath, staleMs);
+    if (!locked) {
+      console.error("[emotion-state] Could not acquire lock, skipping state update");
+    }
 
-  let updated = false;
-  if (latestUser?.content) {
-    updated =
-      (await maybeUpdate(state.users[userKey], latestUser, "user", labels, confidenceMin, historySize)) ||
-      updated;
+    let state: EmotionState;
+    try {
+      state = await readState(statePath);
+      if (!state.users[userKey]) state.users[userKey] = { history: [] };
+      if (!state.agents[agentId]) state.agents[agentId] = { history: [] };
+
+      let updated = false;
+      if (latestUser?.content) {
+        updated =
+          (await maybeUpdate(state.users[userKey], latestUser, "user", labels, confidenceMin, historySize)) ||
+          updated;
+      }
+      if (latestAssistant?.content) {
+        updated =
+          (await maybeUpdate(state.agents[agentId], latestAssistant, "assistant", labels, confidenceMin, historySize)) ||
+          updated;
+      }
+
+      if (updated) {
+        pruneUsers(state, maxUsers);
+        if (locked) {
+          await writeJsonFile(statePath, state);
+        } else {
+          console.error("[emotion-state] Skipping write — no lock held");
+        }
+      }
+    } finally {
+      if (locked) await releaseLock(lockPath);
+    }
+
+    const otherAgents = await loadOtherAgents(
+      getOtherAgentsRoot(agentDir),
+      agentId,
+      DEFAULTS.stateFileName,
+      maxOtherAgents,
+    );
+
+    const block = buildEmotionBlock(state, userKey, agentId, {
+      maxUserEntries,
+      maxAgentEntries,
+      halfLifeHours,
+      trendWindowHours,
+      timeZone,
+      otherAgents,
+    });
+
+    injectBootstrap(context, block);
+  } catch (err) {
+    console.error("[emotion-state] Unhandled error in hook handler:", err);
   }
-  if (latestAssistant?.content) {
-    updated =
-      (await maybeUpdate(state.agents[agentId], latestAssistant, "assistant", labels, confidenceMin, historySize)) ||
-      updated;
-  }
-
-  if (updated) await writeJsonFile(statePath, state);
-
-  const otherAgents = await loadOtherAgents(
-    getOtherAgentsRoot(agentDir),
-    agentId,
-    DEFAULTS.stateFileName,
-    maxOtherAgents,
-  );
-
-  const block = buildEmotionBlock(state, userKey, agentId, {
-    maxUserEntries,
-    maxAgentEntries,
-    halfLifeHours,
-    trendWindowHours,
-    timeZone,
-    otherAgents,
-  });
-
-  injectBootstrap(context, block);
 }
